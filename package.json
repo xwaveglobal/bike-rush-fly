@@ -5,10 +5,10 @@
   "description": "XWAVE Flying Run \u2014 mobile-first 3D flying-car endless runner (Three.js + TypeScript + Vite)",
   "type": "module",
   "scripts": {
-    "dev": "vite --host",
+    "dev": "vite --host 0.0.0.0 --port 3000",
     "build": "tsc --noEmit && vite build",
     "build:single": "tsc --noEmit && vite build --mode single",
-    "preview": "vite preview --host",
+    "preview": "vite preview --host 0.0.0.0 --port 3000",
     "typecheck": "tsc --noEmit",
     "test:fairness": "node --experimental-transform-types --no-warnings tests/fairness.test.ts",
     "test:difficulty": "node --experimental-transform-types --no-warnings tests/difficulty.test.ts",

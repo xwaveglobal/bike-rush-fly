@@ -13,7 +13,8 @@ export default defineConfig(async ({ mode }) => {
     // the 3D car model is fetched as a URL (inlined as a data URL in the single-file build)
     assetsInclude: ['**/*.glb'],
     plugins,
-    server: { host: true, port: 5173 },
+    server: { host: '0.0.0.0', port: 3000, allowedHosts: true },
+    preview: { host: '0.0.0.0', port: 3000 },
     build: {
       target: 'es2020',
       outDir: 'dist',

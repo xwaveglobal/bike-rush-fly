@@ -1,0 +1,458 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #04071a;
+  color: #f8fafc;
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  touch-action: none;
+}
+
+#stage,
+#game {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.sr-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  z-index: 1;
+}
+
+.sr-ui-root {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.sr-interactive {
+  pointer-events: auto;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Home Overlay Layout */
+.sr-home {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 14px 16px 18px;
+  max-width: 540px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.sr-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sr-profile-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(10, 16, 38, 0.88);
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 12px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.sr-rank-shield {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 7px;
+  border-radius: 8px;
+  font-weight: 800;
+  font-size: 13px;
+  color: #04071a;
+}
+
+.sr-wallet-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sr-coin-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(10, 16, 38, 0.88);
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  color: #fde68a;
+  font-weight: 700;
+  font-size: 13px;
+  padding: 7px 11px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.sr-icon-btn {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(10, 16, 38, 0.88);
+  color: #e2e8f0;
+  font-size: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+/* Brand & Side Rails */
+.sr-mid-area {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin: auto 0;
+}
+
+.sr-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sr-rail-tile {
+  width: 54px;
+  height: 54px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(11, 18, 42, 0.88);
+  color: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.14s ease, border-color 0.14s ease;
+}
+
+.sr-rail-tile:hover {
+  transform: translateY(-1px);
+  border-color: rgba(56, 189, 248, 0.55);
+}
+
+.sr-rail-tile span.ico {
+  font-size: 16px;
+  line-height: 1;
+}
+
+/* Bottom Home Controls */
+.sr-home-bottom {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sr-speed-selector {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  background: rgba(8, 13, 31, 0.88);
+  padding: 5px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.sr-speed-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #cbd5e1;
+  border-radius: 8px;
+  padding: 7px 6px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.sr-speed-btn.active {
+  background: rgba(15, 23, 42, 0.95);
+  color: #ffffff;
+}
+
+.sr-play-btn {
+  width: 100%;
+  padding: 14px 20px;
+  border-radius: 14px;
+  border: 1px solid #38bdf8;
+  background: linear-gradient(180deg, #0284c7 0%, #0369a1 100%);
+  color: #ffffff;
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.sr-nav-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.sr-nav-btn {
+  padding: 10px 8px;
+  border-radius: 11px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  background: rgba(11, 19, 43, 0.9);
+  color: #f1f5f9;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+/* Race HUD */
+.sr-hud {
+  position: absolute;
+  inset: 0;
+  padding: 12px 16px 18px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  max-width: 680px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.sr-hud-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sr-hud-card {
+  background: rgba(8, 13, 31, 0.86);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 12px;
+  padding: 8px 12px;
+}
+
+.sr-hud-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.sr-hearts-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 16px;
+}
+
+.sr-special-trigger {
+  padding: 7px 12px;
+  border-radius: 10px;
+  border: 1px solid #a855f7;
+  background: rgba(88, 28, 135, 0.9);
+  color: #ffffff;
+  font-weight: 800;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.sr-danger-banner {
+  align-self: center;
+  background: rgba(15, 23, 42, 0.92);
+  border: 2px solid #f59e0b;
+  color: #fef08a;
+  padding: 8px 18px;
+  border-radius: 12px;
+  font-weight: 800;
+  font-size: 16px;
+  letter-spacing: 0.03em;
+}
+
+.sr-toast-banner {
+  align-self: center;
+  background: rgba(14, 116, 144, 0.92);
+  border: 1px solid #38bdf8;
+  color: #f0f9ff;
+  padding: 7px 14px;
+  border-radius: 10px;
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.sr-hud-bottom {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sr-touch-pad {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  width: 100%;
+  max-width: 340px;
+}
+
+.sr-touch-btn {
+  padding: 10px 0;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(11, 18, 42, 0.84);
+  color: #e2e8f0;
+  font-weight: 800;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+/* Modal System */
+.sr-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(3, 6, 18, 0.84);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+  z-index: 30;
+}
+
+.sr-modal-panel {
+  width: 100%;
+  max-width: 440px;
+  max-height: 92vh;
+  overflow-y: auto;
+  background: #0b1229;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  border-radius: 16px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.sr-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  padding-bottom: 10px;
+}
+
+.sr-modal-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 800;
+  color: #f8fafc;
+}
+
+.sr-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sr-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  background: rgba(15, 23, 42, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+}
+
+.sr-action-btn {
+  padding: 8px 14px;
+  border-radius: 9px;
+  border: 1px solid #38bdf8;
+  background: #0284c7;
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.sr-action-btn.secondary {
+  border-color: rgba(148, 163, 184, 0.35);
+  background: #1e293b;
+  color: #e2e8f0;
+}
+
+.sr-car-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+
+.sr-car-card {
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.sr-car-card.selected {
+  border-color: #38bdf8;
+  background: rgba(12, 34, 64, 0.92);
+}
+
+.sr-car-swatch {
+  height: 46px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 12px;
+}
