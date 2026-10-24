@@ -1,383 +1,316 @@
-import {
-  CAR_HALF,
-  LANES,
-  LaneIndex,
-  POWERUP_DURATION,
-  RANKS,
-  RankClass,
-  SPEED,
-  SPEED_LEVELS,
-  SpeedLevelId,
-  SpecialId,
-  TRACKS,
-  TrackId,
-  WORLDS,
-} from '../config';
-import { canPassObstacle, OBSTACLE_RULES, PASS_MASK } from './ObstacleRules';
-import { Player } from './Player';
-import { ActiveObstacle, ActivePickup, PickupKind, Spawner } from './Spawner';
+import { LANES, HEIGHT, LEVELS, type SpeedLevel } from '../config.ts';
+import { Player } from './Player.ts';
+import { Spawner, speedAt, type WorldId } from './Spawner.ts';
+import type { Variant } from './Difficulty.ts';
+import type { Course } from './Courses.ts';
+import { hitboxes, sweepX, zOffset } from './ObstacleRules.ts';
+import type { Box, ObstacleSpec, PickupSpec, RowSpec } from './types.ts';
+import { Rng } from '../core/Rng.ts';
 
-export type DangerHint = 'up' | 'down' | 'left' | 'right' | 'sos' | null;
+export const SPAWN_AHEAD = 175;
+const DESPAWN_BEHIND = 14;
 
-export interface WorldEvents {
-  onCoin: () => void;
-  onRing: () => void;
-  onPowerup: (kind: PickupKind) => void;
-  onRankUp: (newRank: RankClass) => void;
-  onBeatBest: () => void;
-  onPortal: (worldIndex: number) => void;
-  onHeartLost: (remainingHearts: number) => void;
-  onAutoSpecial: (special: SpecialId) => void;
-  onCrashEnd: () => void;
-  onTrackFinish: () => void;
+let nextId = 1;
+
+export interface LiveObstacle {
+  id: number;
+  spec: ObstacleSpec;
+  row: RowSpec;
+  /** world z of the obstacle origin (negative = ahead) */
+  z: number;
+  /** current sweep x for moving obstacles */
+  sx: number;
+  boxes: Box[];
+  hit: boolean;
+  smashed: boolean;
+  passed: boolean;
+  /** closest clearance while overlapping in z (for near misses) */
+  minGap: number;
+  /** z velocity this frame (m/s), for swept collision and visuals */
+  vz: number;
+  /** renderer handle */
+  view?: unknown;
 }
 
+export interface LivePickup {
+  id: number;
+  spec: PickupSpec;
+  x: number;
+  y: number;
+  z: number;
+  attracted: boolean;
+  collected: boolean;
+  view?: unknown;
+}
+
+export type WorldEvent =
+  | { type: 'hit'; o: LiveObstacle }
+  | { type: 'smash'; o: LiveObstacle }
+  | { type: 'pass'; o: LiveObstacle; gap: number }
+  | { type: 'ring'; o: LiveObstacle }
+  | { type: 'pickup'; p: LivePickup }
+  | { type: 'world'; world: WorldId };
+
+export interface WorldHooks {
+  spawnObstacle?: (o: LiveObstacle) => void;
+  despawnObstacle?: (o: LiveObstacle) => void;
+  spawnPickup?: (p: LivePickup) => void;
+  despawnPickup?: (p: LivePickup) => void;
+}
+
+export interface StepOptions {
+  invulnerable: boolean;
+  smash: boolean; // turbo: obstacles explode on contact
+  magnet: boolean;
+  magnetRadius: number;
+  speedMul: number;
+}
+
+/**
+ * Pure simulation of the run: scrolling obstacles/pickups toward the car (the
+ * car sits at z = 0, the world moves — keeps float precision perfect on long runs),
+ * swept AABB collision, near-miss tracking and pickup collection.
+ */
 export class World {
-  public player = new Player();
-  public spawner = new Spawner();
-  public obstacles: ActiveObstacle[] = [];
-  public pickups: ActivePickup[] = [];
+  player = new Player();
+  spawner: Spawner;
+  dist = 0;
+  speed = speedAt(0);
+  time = 0;
+  obstacles: LiveObstacle[] = [];
+  pickups: LivePickup[] = [];
+  /** rows not yet passed (for autopilot/fairness tooling) */
+  upcoming: RowSpec[] = [];
+  world: WorldId = 'city';
+  hooks: WorldHooks = {};
+  private carBox: Box = { minX: 0, maxX: 0, minY: 0, maxY: 0, minZ: 0, maxZ: 0 };
+  private events: WorldEvent[] = [];
 
-  public speedLevel: SpeedLevelId = 'normal';
-  public trackId: TrackId = 'endless';
-  public roadSpeed: number = SPEED.start;
-  public targetSpeed: number = SPEED.start;
-
-  public distanceMeters = 0;
-  public exp = 0;
-  public coins = 0;
-  public ringsPassed = 0;
-  public hearts = 1;
-  public revivesUsed = 0;
-  public maxRevives = 2;
-
-  public worldIndex = 0;
-  public nextPortalDist = 1000;
-  public currentRank: RankClass = 'D';
-  public beatBestTriggered = false;
-
-  // Active power-up timers
-  public shieldTimer = 0;
-  public magnetTimer = 0;
-  public turboTimer = 0;
-  public doubleCoinsTimer = 0;
-
-  // Pre-race equipped special charge
-  public equippedSpecial: SpecialId | null = null;
-  public specialCharges = 0;
-
-  public dangerHint: DangerHint = null;
-  public autopilot = false;
-  private autopilotCooldown = 0;
-
-  public reset(opts: {
-    speedLevel: SpeedLevelId;
-    trackId: TrackId;
-    equippedSpecial: SpecialId | null;
-    autopilot?: boolean;
-  }): void {
-    this.speedLevel = opts.speedLevel;
-    this.trackId = opts.trackId;
-    this.equippedSpecial = opts.equippedSpecial;
-    this.specialCharges = opts.equippedSpecial ? 1 : 0;
-    this.autopilot = Boolean(opts.autopilot);
-
-    this.player.reset();
-    this.spawner.reset();
-    this.obstacles = [];
-    this.pickups = [];
-
-    const speedCfg = SPEED_LEVELS[this.speedLevel];
-    this.roadSpeed = SPEED.start * speedCfg.speedMult;
-    this.targetSpeed = this.roadSpeed;
-
-    this.distanceMeters = 0;
-    this.exp = 0;
-    this.coins = 0;
-    this.ringsPassed = 0;
-    this.hearts = opts.trackId === 'training' ? 3 : 1;
-    this.revivesUsed = 0;
-
-    this.worldIndex = 0;
-    this.nextPortalDist = 1000;
-    this.currentRank = 'D';
-    this.beatBestTriggered = false;
-
-    this.shieldTimer = 0;
-    this.magnetTimer = 0;
-    this.turboTimer = 0;
-    this.doubleCoinsTimer = 0;
-    this.dangerHint = null;
-    this.autopilotCooldown = 0;
+  constructor(seed?: number) {
+    this.spawner = new Spawner(new Rng(seed));
   }
 
-  public revive(): void {
-    this.revivesUsed += 1;
-    this.player.invulnTimer = 2.6;
-    this.player.vMode = 'normal';
-    this.player.y = 0.78;
-    // Clear immediate obstacles within 28 m
-    for (const obs of this.obstacles) {
-      if (obs.z > -28 && obs.z < 8) {
-        obs.smashed = true;
-      }
-    }
+  /** @param startDist start the run further down the road (tests / debug "jump to a rank") */
+  reset(seed?: number, course: Course | null = null, level: SpeedLevel = 'normal', startDist = 0, variant: Variant = 'endless') {
+    this.spawner.course = course;
+    this.spawner.variant = variant;
+    this.spawner.speedMul = LEVELS[level].speed;
+    this.spawner.gapMul = LEVELS[level].gap;
+    this.spawner.level = level;
+    for (const o of this.obstacles) this.hooks.despawnObstacle?.(o);
+    for (const p of this.pickups) this.hooks.despawnPickup?.(p);
+    this.obstacles.length = 0;
+    this.pickups.length = 0;
+    this.upcoming.length = 0;
+    if (seed !== undefined) this.spawner.rng = new Rng(seed);
+    this.spawner.reset(startDist);
+    this.player.reset(1);
+    this.dist = startDist;
+    this.time = 0;
+    this.speed = this.spawner.speed(startDist);
+    this.world = this.spawner.worldAt(startDist);
   }
 
-  public useSpecialButton(): boolean {
-    if (!this.equippedSpecial || this.specialCharges <= 0) return false;
-    if (this.player.activateSpecial(this.equippedSpecial)) {
-      this.specialCharges -= 1;
-      if (this.equippedSpecial === 'hyper') {
-        this.coins += 25;
-      }
-      return true;
+  /** Clear everything near the car (used after a respawn). */
+  clearAhead(meters: number) {
+    const keep: LiveObstacle[] = [];
+    for (const o of this.obstacles) {
+      if (o.z > -meters) this.hooks.despawnObstacle?.(o);
+      else keep.push(o);
     }
-    return false;
+    this.obstacles = keep;
+    this.upcoming = this.upcoming.filter((r) => r.dist - this.dist > meters);
+    // and make sure the spawner does not place rows inside the cleared zone
+    while (this.spawner.rows.length && this.spawner.rows[0].dist - this.dist < meters) this.spawner.rows.shift();
+    this.spawner.resetReach(this.player.lane);
   }
 
-  public update(dt: number, prevBestExp: number, events: WorldEvents): void {
-    const speedCfg = SPEED_LEVELS[this.speedLevel];
-    const trackCfg = TRACKS.find((t) => t.id === this.trackId) ?? TRACKS[0];
+  step(dt: number, opt: StepOptions): WorldEvent[] {
+    const ev = this.events;
+    ev.length = 0;
+    this.time += dt;
+    // v2.2: the road speed glides to its target (level, rank phase, turbo, respawn) — never a jolt
+    const want = this.spawner.speed(this.dist) * opt.speedMul;
+    this.speed += (want - this.speed) * Math.min(1, dt * (want < this.speed ? 3 : 4));
+    if (Math.abs(want - this.speed) < 0.05) this.speed = want;
+    const dz = this.speed * dt;
+    this.dist += dz;
 
-    // Smooth target speed progression
-    const rampT = Math.min(1, this.distanceMeters / SPEED.rampDist);
-    const baseSpeed = (SPEED.start + (SPEED.max - SPEED.start) * rampT) * speedCfg.speedMult;
-    const turboMult = this.turboTimer > 0 ? SPEED.turboMult : 1.0;
-    this.targetSpeed = baseSpeed * turboMult;
-    this.roadSpeed += (this.targetSpeed - this.roadSpeed) * Math.min(1, dt * 4.5);
-
-    // Update power-up timers
-    if (this.shieldTimer > 0) this.shieldTimer = Math.max(0, this.shieldTimer - dt);
-    if (this.magnetTimer > 0) this.magnetTimer = Math.max(0, this.magnetTimer - dt);
-    if (this.turboTimer > 0) {
-      this.turboTimer = Math.max(0, this.turboTimer - dt);
-      if (this.turboTimer === 0) {
-        this.player.invulnTimer = Math.max(this.player.invulnTimer, 0.8);
-      }
-    }
-    if (this.doubleCoinsTimer > 0) this.doubleCoinsTimer = Math.max(0, this.doubleCoinsTimer - dt);
-
-    // Advance distance & EXP
-    const dZ = this.roadSpeed * dt;
-    this.distanceMeters += dZ;
-    this.spawner.nextRowZ += dZ;
-
-    if (trackCfg.expMult > 0) {
-      this.exp = Math.floor(this.distanceMeters * speedCfg.expRate * trackCfg.expMult);
-      const newRank = this.computeRunRank(this.exp, this.trackId === 'mega_rush');
-      if (newRank !== this.currentRank) {
-        this.currentRank = newRank;
-        events.onRankUp(newRank);
-      }
-      if (!this.beatBestTriggered && prevBestExp > 100 && this.exp > prevBestExp) {
-        this.beatBestTriggered = true;
-        events.onBeatBest();
-      }
+    const w = this.spawner.worldAt(this.dist);
+    if (w !== this.world) {
+      this.world = w;
+      ev.push({ type: 'world', world: w });
     }
 
-    // World portal transitions every 1,000 m
-    if (this.distanceMeters >= this.nextPortalDist) {
-      this.nextPortalDist += 1000;
-      this.worldIndex = (this.worldIndex + 1) % WORLDS.length;
-      events.onPortal(this.worldIndex);
+    this.player.update(dt);
+
+    // ---- spawn
+    const sp = this.spawner;
+    sp.generateUntil(this.dist + SPAWN_AHEAD + 60);
+    while (sp.rows.length && sp.rows[0].dist - this.dist < SPAWN_AHEAD) {
+      this.spawnRow(sp.rows.shift()!);
     }
-
-    // Check finite track finish
-    if (trackCfg.lengthMeters > 0 && this.distanceMeters >= trackCfg.lengthMeters) {
-      events.onTrackFinish();
-      return;
+    while (sp.pickups.length && sp.pickups[0].dist - this.dist < SPAWN_AHEAD) {
+      const spec = sp.pickups.shift()!;
+      const p: LivePickup = {
+        id: nextId++,
+        spec,
+        x: LANES[spec.lane],
+        y: spec.y,
+        z: -(spec.dist - this.dist),
+        attracted: false,
+        collected: false,
+      };
+      this.pickups.push(p);
+      this.hooks.spawnPickup?.(p);
     }
+    while (this.upcoming.length && this.upcoming[0].dist < this.dist - 6) this.upcoming.shift();
 
-    // Update player kinematics
-    const { landedShockwave } = this.player.update(dt, this.roadSpeed);
-    if (landedShockwave) {
-      for (const obs of this.obstacles) {
-        if (obs.z > -26 && obs.z < 6) {
-          obs.smashed = true;
-        }
-      }
-    }
-
-    // Spawn upcoming rows
-    this.spawner.update(
-      this.distanceMeters,
-      this.exp,
-      this.roadSpeed,
-      speedCfg,
-      this.trackId,
-      this.obstacles,
-      this.pickups
-    );
-
-    // Compute danger hint & optional autopilot
-    this.dangerHint = this.solveDangerHint();
-    if (this.autopilot) {
-      this.runAutopilot(dt);
-    }
-
-    // Scroll & collide obstacles
+    // ---- obstacles
+    const car = this.player.hitbox(this.carBox);
     for (let i = this.obstacles.length - 1; i >= 0; i--) {
-      const obs = this.obstacles[i];
-      const rule = OBSTACLE_RULES[obs.kind];
-      const extraSpeed = rule.oncomingSpeed ?? 0;
-      obs.z += (this.roadSpeed + extraSpeed) * dt;
-
-      if (rule.movesLanes) {
-        obs.phase += dt * 2.2;
-        obs.x = LANES[obs.baseLane] + Math.sin(obs.phase) * 2.4;
-        obs.lane = (obs.x < -1.4 ? 0 : obs.x > 1.4 ? 2 : 1) as LaneIndex;
-      }
-
-      if (!obs.smashed && !obs.passed) {
-        const zOverlap = Math.abs(obs.z - this.player.z) < CAR_HALF.z + rule.halfZ;
-        const xOverlap = Math.abs(obs.x - this.player.x) < CAR_HALF.x + rule.halfX * 0.82;
-
-        if (zOverlap && xOverlap) {
-          if (rule.isBonusRing) {
-            obs.passed = true;
-            this.ringsPassed += 1;
-            this.doubleCoinsTimer = POWERUP_DURATION.doubleCoins;
-            events.onRing();
-          } else if (!canPassObstacle(obs.kind, this.player.y)) {
-            if (this.turboTimer > 0 || this.player.isProtected()) {
-              obs.smashed = true;
-            } else if (this.shieldTimer > 0) {
-              this.shieldTimer = 0;
-              this.player.invulnTimer = 1.2;
-              obs.smashed = true;
-            } else if (this.trackId === 'training') {
-              obs.smashed = true;
-              this.player.hop();
-            } else if (this.hearts > 1) {
-              this.hearts -= 1;
-              this.player.invulnTimer = 2.0;
-              obs.smashed = true;
-              events.onHeartLost(this.hearts);
-            } else if (this.equippedSpecial && this.specialCharges > 0) {
-              // v4.5 Last-chance auto special activation!
-              const sp = this.equippedSpecial;
-              this.useSpecialButton();
-              obs.smashed = true;
-              events.onAutoSpecial(sp);
-            } else {
-              obs.smashed = true;
-              events.onCrashEnd();
-              return;
-            }
+      const o = this.obstacles[i];
+      const prevZ = o.z;
+      this.placeObstacle(o, dt);
+      const moved = Math.max(0, o.z - prevZ);
+      if (!o.hit && !o.smashed) {
+        let overlapZ = false;
+        let collide = false;
+        let gap = Infinity;
+        for (const b of o.boxes) {
+          // swept along z: union of previous and current position
+          const zMin = b.minZ - moved;
+          if (car.maxZ < zMin || car.minZ > b.maxZ) continue;
+          overlapZ = true;
+          const gx = Math.max(b.minX - car.maxX, car.minX - b.maxX);
+          const gy = Math.max(b.minY - car.maxY, car.minY - b.maxY);
+          const g = Math.max(gx, gy);
+          if (g < 0) collide = true;
+          else gap = Math.min(gap, g);
+        }
+        if (collide) {
+          if (opt.smash) {
+            o.smashed = true;
+            ev.push({ type: 'smash', o });
+          } else if (!opt.invulnerable) {
+            o.hit = true;
+            ev.push({ type: 'hit', o });
           }
+        } else if (overlapZ) {
+          o.minGap = Math.min(o.minGap, gap);
         }
       }
-
-      if (obs.z > 14) {
+      // passed the car entirely?
+      if (!o.passed && this.boxesBehind(o)) {
+        o.passed = true;
+        if (!o.hit && !o.smashed) {
+          ev.push({ type: 'pass', o, gap: o.minGap });
+          if (o.spec.type === 'ring' && Math.abs(this.player.x - LANES[o.spec.lane]) < 0.9 && this.player.y < 2.3)
+            ev.push({ type: 'ring', o });
+        }
+      }
+      if (o.z > DESPAWN_BEHIND + 8) {
+        this.hooks.despawnObstacle?.(o);
         this.obstacles.splice(i, 1);
       }
     }
 
-    // Scroll & collect pickups
+    // ---- pickups
+    const px = this.player.x;
+    const py = this.player.y;
     for (let i = this.pickups.length - 1; i >= 0; i--) {
       const p = this.pickups[i];
-      p.z += this.roadSpeed * dt;
-
-      if (!p.collected && p.kind === 'coin' && this.magnetTimer > 0 && p.z > -22 && p.z < 4) {
-        p.x += (this.player.x - p.x) * Math.min(1, dt * 11);
-        p.y += (this.player.y - p.y) * Math.min(1, dt * 11);
+      const prevZ = p.z;
+      if (p.attracted) {
+        const k = 1 - Math.exp(-12 * dt);
+        p.x += (px - p.x) * k;
+        p.y += (py - p.y) * k;
+        p.z += (0 - p.z) * k + dz * 0.15;
+      } else {
+        p.z += dz;
+        if (
+          opt.magnet &&
+          p.spec.kind === 'coin' &&
+          p.z > -opt.magnetRadius * 1.6 &&
+          p.z < 1 &&
+          Math.abs(p.x - px) < opt.magnetRadius
+        )
+          p.attracted = true;
       }
-
       if (!p.collected) {
-        const dx = Math.abs(p.x - this.player.x);
-        const dy = Math.abs(p.y - this.player.y);
-        const dz = Math.abs(p.z - this.player.z);
-        if (dx < 1.35 && dy < 1.65 && dz < 2.1) {
+        const zLo = Math.min(prevZ, p.z) - 0.5;
+        const zHi = Math.max(prevZ, p.z) + 0.5;
+        const inZ = zHi > -1.1 && zLo < 1.1;
+        const r = p.spec.kind === 'coin' ? 1.05 : 1.25;
+        if (inZ && Math.abs(p.x - px) < r && Math.abs(p.y - py) < r + 0.15) {
           p.collected = true;
-          this.applyPickup(p.kind, events);
+          ev.push({ type: 'pickup', p });
         }
       }
-
-      if (p.collected || p.z > 12) {
+      if (p.collected || p.z > DESPAWN_BEHIND) {
+        this.hooks.despawnPickup?.(p);
         this.pickups.splice(i, 1);
       }
     }
+    return ev;
   }
 
-  private applyPickup(kind: PickupKind, events: WorldEvents): void {
-    if (kind === 'coin') {
-      const mult = this.doubleCoinsTimer > 0 ? 2 : 1;
-      this.coins += mult;
-      events.onCoin();
-      return;
+  /** a row reaches spawn distance: its obstacles go live */
+  private spawnRow(row: RowSpec) {
+    this.upcoming.push(row);
+    for (const spec of row.obstacles) {
+      const o: LiveObstacle = {
+        id: nextId++,
+        spec,
+        row,
+        z: 0,
+        sx: 0,
+        boxes: [],
+        hit: false,
+        smashed: false,
+        passed: false,
+        minGap: Infinity,
+        vz: this.speed,
+      };
+      this.placeObstacle(o, 0);
+      this.obstacles.push(o);
+      this.hooks.spawnObstacle?.(o);
     }
-    if (kind === 'shield') {
-      this.shieldTimer = POWERUP_DURATION.shield;
-    } else if (kind === 'magnet') {
-      this.magnetTimer = POWERUP_DURATION.magnet;
-    } else if (kind === 'turbo') {
-      this.turboTimer = POWERUP_DURATION.turbo;
-    } else if (kind === 'doubleCoins') {
-      this.doubleCoinsTimer = POWERUP_DURATION.doubleCoins;
-    } else if (kind === 'airDash') {
-      this.player.triggerAirDash();
-    } else if (kind === 'heart') {
-      this.hearts = Math.min(3, this.hearts + 1);
-    }
-    events.onPowerup(kind);
   }
 
-  private computeRunRank(exp: number, isMegaRush: boolean): RankClass {
-    let best: RankClass = 'D';
-    for (const r of RANKS) {
-      if (r.track2Only && !isMegaRush) continue;
-      if (exp >= r.exp) best = r.id;
-    }
-    return best;
-  }
-
-  private solveDangerHint(): DangerHint {
-    if (this.player.isProtected() || this.turboTimer > 0) return null;
-    const lookAheadZ = -this.roadSpeed * 0.85;
-    let nearestThreat: ActiveObstacle | null = null;
-
-    for (const obs of this.obstacles) {
-      if (obs.smashed || obs.passed) continue;
-      if (obs.z < lookAheadZ || obs.z > -1.5) continue;
-      if (obs.lane === this.player.lane && !canPassObstacle(obs.kind, this.player.y)) {
-        if (!nearestThreat || obs.z > nearestThreat.z) {
-          nearestThreat = obs;
-        }
+  /** v2.2 Bonus set pieces: rows added after the fact (rows already in view spawn at once, the rest queue) */
+  injectRows(rows: RowSpec[]) {
+    for (const row of rows) {
+      if (row.dist - this.dist < SPAWN_AHEAD) {
+        this.spawnRow(row);
+        this.upcoming.sort((a, b) => a.dist - b.dist);
+      } else {
+        this.spawner.rows.push(row);
+        this.spawner.rows.sort((a, b) => a.dist - b.dist);
       }
     }
-
-    if (!nearestThreat) return null;
-    const rule = OBSTACLE_RULES[nearestThreat.kind];
-    if ((rule.passMask & PASS_MASK.HIGH) !== 0) return 'up';
-    if ((rule.passMask & PASS_MASK.LOW) !== 0) return 'down';
-
-    // Check adjacent lanes at nearestThreat.z
-    const candidates: LaneIndex[] =
-      this.player.lane === 1 ? [0, 2] : ([1] as LaneIndex[]);
-    for (const cLane of candidates) {
-      const blocked = this.obstacles.some(
-        (o) =>
-          !o.smashed &&
-          Math.abs(o.z - nearestThreat!.z) < 4.5 &&
-          o.lane === cLane &&
-          !canPassObstacle(o.kind, this.player.y)
-      );
-      if (!blocked) {
-        return cLane < this.player.lane ? 'left' : 'right';
-      }
-    }
-    return this.specialCharges > 0 ? 'sos' : 'up';
   }
 
-  private runAutopilot(dt: number): void {
-    this.autopilotCooldown = Math.max(0, this.autopilotCooldown - dt);
-    if (this.autopilotCooldown > 0 || !this.dangerHint) return;
-    if (this.dangerHint === 'up') this.player.hop();
-    else if (this.dangerHint === 'down') this.player.dive();
-    else if (this.dangerHint === 'left') this.player.moveLane(-1);
-    else if (this.dangerHint === 'right') this.player.moveLane(1);
-    else if (this.dangerHint === 'sos') this.useSpecialButton();
-    this.autopilotCooldown = 0.16;
+  private placeObstacle(o: LiveObstacle, dt: number) {
+    const rem = o.row.dist - this.dist; // metres until the row reaches the car
+    const prev = o.z;
+    o.z = -(rem + zOffset(o.spec, Math.max(0, rem)));
+    o.vz = dt > 0 ? (o.z - prev) / dt : this.speed;
+    o.sx = sweepX(o.spec, rem);
+    hitboxes(o.spec, o.sx, o.boxes);
+    for (const b of o.boxes) {
+      b.minZ += o.z;
+      b.maxZ += o.z;
+    }
+  }
+
+  private boxesBehind(o: LiveObstacle) {
+    for (const b of o.boxes) if (b.minZ < this.carBox.maxZ) return false;
+    return true;
+  }
+
+  /** Lane-height helpers for UI/debug */
+  static heightOf(state: 'LOW' | 'NORMAL' | 'HIGH') {
+    return HEIGHT[state];
   }
 }

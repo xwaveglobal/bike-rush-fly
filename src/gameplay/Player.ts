@@ -1,314 +1,611 @@
-import { HEIGHT, LANES, LaneIndex, SpecialId, TIMING } from '../config';
+import { AIR_DASH, CAR_HALF, CAR_HALF_Y_LOW, HEIGHT, LANES, TIMING } from '../config.ts';
+import { clamp, clamp01, easeInOutSine, easeOutBack, easeOutCubic, easeOutQuad, lerp } from '../core/math.ts';
 
-export type VerticalMode = 'normal' | 'hop' | 'dive' | 'airdash' | 'roadster' | 'hyper' | 'sos';
+const easeInOutCubic = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+import type { Action } from '../core/Input.ts';
+import type { Box } from './types.ts';
 
+export type VMode = 'none' | 'up' | 'down';
+export type VPhase = 'idle' | 'antic' | 'exec' | 'hold' | 'recover';
+
+export interface PlayerEvents {
+  lane?: (dir: -1 | 1) => void;
+  up?: () => void;
+  down?: () => void;
+  land?: (fromMode: VMode) => void;
+  bump?: (dir: -1 | 1) => void;
+  /** booster second swipe in the air (edge → far edge): flip + consume a charge */
+  airDash?: (dir: -1 | 1) => void;
+  /** an extra air swipe was refused (one lane per hop) */
+  airBlocked?: (dir: -1 | 1) => void;
+  /** Step 06.5 AIR DASH collectible: the maneuver starts (dir = sideways direction) */
+  airDashStart?: (dir: -1 | 1) => void;
+  /** a swipe made during the AIR DASH (absorbed) */
+  dashAbsorbed?: (a: Action) => void;
+}
+
+/**
+ * Gameplay state machine for the car. Pure logic — renderers read the exposed
+ * pose values (x, y, bank inputs, wing deploy, thruster tilt...) every frame.
+ *
+ * Interruption rules:
+ *  - Lane changes are always allowed (also while HIGH or LOW); a second press
+ *    mid-slide retargets immediately so double-swipes cross two lanes.
+ *  - UP while already HIGH extends the hold; UP during DOWN (or while recovering)
+ *    skips anticipation and launches from the current height. DOWN mirrors this.
+ *  - Inputs arriving during an anticipation are buffered and replayed after it.
+ */
 export class Player {
-  public lane: LaneIndex = 1;
-  public prevLane: LaneIndex = 1;
-  public x = 0;
-  public y: number = HEIGHT.NORMAL;
-  public z = 0;
+  lane = 1;
+  x: number = LANES[1];
+  y: number = HEIGHT.NORMAL;
+  /** lateral velocity (m/s) — drives banking */
+  vx = 0;
 
-  public laneTimer = 0;
-  public laneDuration: number = TIMING.laneSwitch;
-  public startX = 0;
-  public targetX = 0;
-  public queuedLaneDir: -1 | 0 | 1 = 0;
+  vmode: VMode = 'none';
+  vphase: VPhase = 'idle';
+  private phaseT = 0;
+  private phaseDur = 0;
+  private yFrom: number = HEIGHT.NORMAL;
 
-  public vMode: VerticalMode = 'normal';
-  public vTimer = 0;
-  public restTimer = 0;
-  public invulnTimer = 0;
-  public airLaneChanged = false;
+  private laneFrom: number = LANES[1];
+  private laneT = 1;
+  private laneDur: number = TIMING.laneChange;
 
-  // Visual pose telemetry for 3D MeshCar
-  public roll = 0;
-  public pitch = 0;
-  public spoilerOpen = 0; // 0 = flush, 1 = deployed (airborne only per v4.5)
-  public diveSquash = 0;  // 0 = normal, 1 = compressed low dive pose
-  public wheelSpin = 0;
-  public steerAngle = 0;
+  private buffer: { a: Action; t: number }[] = [];
+  private time = 0;
 
-  public hopsAndDivesCount = 0;
-  public specialsUsedCount = 0;
+  /** visual drivers (0..1) */
+  wings = 0;
+  thrusterTilt = 0; // 1 = pointing straight down (fly up), -1 = tucked (fly down)
+  engine = 0; // extra engine brightness
+  squash = 0; // >0 compressed (LOW), <0 stretched (launch)
+  orange = 0; // thruster colour blend toward orange
+  sideThrust = 0; // -1 left thrusters fire, +1 right
+  /** 0 = driving on the road (pods are wheels), 1 = airborne (pods are thrusters) */
+  air = 0;
+  /** 0 = wheels out, 1 = wheels tucked into the body (FLY DOWN) */
+  retract = 0;
 
-  public reset(): void {
-    this.lane = 1;
-    this.prevLane = 1;
-    this.x = LANES[1];
+  stats = { lanes: 0, ups: 0, downs: 0 };
+  events: PlayerEvents = {};
+  frozen = false;
+
+  reset(lane = 1) {
+    this.lane = lane;
+    this.x = this.laneFrom = LANES[lane];
+    this.laneT = 1;
     this.y = HEIGHT.NORMAL;
-    this.z = 0;
-    this.laneTimer = 0;
-    this.startX = LANES[1];
-    this.targetX = LANES[1];
-    this.queuedLaneDir = 0;
-    this.vMode = 'normal';
-    this.vTimer = 0;
-    this.restTimer = 0;
-    this.invulnTimer = 0;
-    this.airLaneChanged = false;
-    this.roll = 0;
-    this.pitch = 0;
-    this.spoilerOpen = 0;
-    this.diveSquash = 0;
-    this.wheelSpin = 0;
-    this.steerAngle = 0;
-    this.hopsAndDivesCount = 0;
-    this.specialsUsedCount = 0;
+    this.vx = 0;
+    this.vmode = 'none';
+    this.vphase = 'idle';
+    this.buffer.length = 0;
+    this.landLane = 0;
+    this.pendingLane = 0;
+    this.isAirDash = false;
+    this.airDashPending = false;
+    this.airDashT = 0;
+    this.jumpReadyAt = 0;
+    this.isSuper = false;
+    this.isHyper = false;
+    this.isEscape = false;
+    this.wings = this.thrusterTilt = this.engine = this.squash = this.orange = this.sideThrust = this.air = this.retract = 0;
+    this.stats = { lanes: 0, ups: 0, downs: 0 };
+    this.frozen = false;
   }
 
-  public isAirborne(): boolean {
-    return (
-      this.vMode === 'hop' ||
-      this.vMode === 'airdash' ||
-      this.vMode === 'roadster' ||
-      this.vMode === 'hyper' ||
-      this.vMode === 'sos'
-    );
-  }
-
-  public isProtected(): boolean {
-    return (
-      this.invulnTimer > 0 ||
-      this.vMode === 'airdash' ||
-      this.vMode === 'roadster' ||
-      this.vMode === 'hyper' ||
-      this.vMode === 'sos'
-    );
-  }
-
-  public moveLane(dir: -1 | 1): boolean {
-    if (this.vMode === 'airdash') return false;
-    if (this.laneTimer > 0) {
-      this.queuedLaneDir = dir;
-      return false;
+  input(a: Action) {
+    if (this.frozen) return;
+    // Step 06.5: the AIR DASH trajectory is fixed (two lanes, one roll, opposite edge): swipes during it
+    // are absorbed — never queued, so nothing fires unexpectedly after the landing
+    if (this.isAirDash) {
+      this.events.dashAbsorbed?.(a);
+      return;
     }
-    if (this.vMode === 'hop' && this.airLaneChanged) {
-      return false; // v1.9 one lane per hop rule
+    if (a === 'left' || a === 'right') {
+      this.changeLane(a === 'left' ? -1 : 1);
+      return;
     }
-    const next = (this.lane + dir) as number;
-    if (next < 0 || next > 2) return false;
-    this.prevLane = this.lane;
-    this.lane = next as LaneIndex;
-    this.startX = this.x;
-    this.targetX = LANES[this.lane];
-    this.laneDuration = TIMING.laneSwitch;
-    this.laneTimer = this.laneDuration;
-    if (this.vMode === 'hop') {
-      this.airLaneChanged = true;
+    // touch-and-go: UP pressed while still coming down from a hop → jump again the moment it lands
+    if (a === 'up' && !this.canJump) {
+      this.buffer.push({ a, t: this.time });
+      return;
     }
-    return true;
+    if (this.vphase === 'antic') {
+      this.buffer.push({ a, t: this.time });
+      return;
+    }
+    if (a === 'up') this.flyUp();
+    else this.flyDown();
   }
 
-  public triggerAirDash(): boolean {
-    // Outer lane 2-lane flip across to opposite outer lane
-    const target: LaneIndex = this.lane === 0 ? 2 : this.lane === 2 ? 0 : 2;
-    this.prevLane = this.lane;
+  /** a lane swipe received mid-slide; runs once the car has settled in its lane */
+  private pendingLane: -1 | 1 | 0 = 0;
+
+  /** lane changes made during the current hop (max 1, booster exception below) */
+  private airLaneUsed = 0;
+  /** lane at take-off of the current hop */
+  private hopLane = 1;
+  /** true while the player holds an AIR DASH booster charge (set by the game) */
+  canAirDash: () => boolean = () => false;
+
+  /**
+   * In the air the car may change lane ONCE per hop, then it has to land.
+   * Exception: took off from an edge lane (0 or 2) with a booster → a second swipe in
+   * the same direction carries it on to the far edge (2 lanes) with a flip.
+   */
+  /** lane changes still allowed before touching down (Infinity on the ground) */
+  get airLanesLeft() {
+    if (this.vmode !== 'up' || this.isEscape) return Infinity;
+    return Math.max(0, 1 - this.airLaneUsed);
+  }
+
+  /** seconds until the current hop touches down (0 on the ground) */
+  get timeToLand() {
+    if (this.vmode !== 'up') return 0;
+    const left = Math.max(0, this.phaseDur - this.phaseT);
+    if (this.isAirDash) {
+      if (this.vphase === 'exec') return left + AIR_DASH.hold + AIR_DASH.recover;
+      if (this.vphase === 'hold') return left + AIR_DASH.recover;
+      return left;
+    }
+    const ex = this.isEscape ? TIMING.escExec : this.isHyper ? TIMING.hyperExec : this.isSuper ? TIMING.superExec : TIMING.upExec;
+    const ho = this.isEscape ? TIMING.escHold : this.isHyper ? TIMING.hyperHold : this.isSuper ? TIMING.superHold : TIMING.upHold;
+    const re = this.isEscape ? TIMING.escRecover : this.isHyper ? TIMING.hyperRecover : this.isSuper ? TIMING.superRecover : TIMING.upRecover;
+    if (this.vphase === 'antic') return left + ex + ho + re;
+    if (this.vphase === 'exec') return left + ho + re;
+    if (this.vphase === 'hold') return left + re;
+    return left;
+  }
+
+  private airAllowed(dir: -1 | 1): 'ok' | 'dash' | 'no' {
+    if (this.vmode !== 'up' || this.isEscape) return 'ok';
+    if (this.airLaneUsed === 0) return 'ok';
+    const edge = this.hopLane === 0 || this.hopLane === 2;
+    const continuing = (this.hopLane === 0 && dir === 1) || (this.hopLane === 2 && dir === -1);
+    if (this.airLaneUsed === 1 && edge && continuing && this.canAirDash()) return 'dash';
+    return 'no';
+  }
+
+  private changeLane(dir: -1 | 1) {
+    if (this.laneT < 1) {
+      // never retarget mid-slide (the car would stop between lanes): queue exactly one step
+      this.pendingLane = dir;
+      return;
+    }
+    const target = clamp(this.lane + dir, 0, 2);
+    if (target === this.lane) {
+      this.events.bump?.(dir);
+      this.sideThrust = dir * 0.6;
+      return;
+    }
+    const air = this.airAllowed(dir);
+    if (air === 'no') {
+      // about to touch down: keep the swipe and steer the instant the wheels are on the road
+      if (this.timeToLand < 0.32) {
+        this.landLane = dir;
+        this.landLaneT = this.time;
+        return;
+      }
+      this.events.airBlocked?.(dir);
+      return;
+    }
+    if (this.vmode === 'up') this.airLaneUsed++;
+    if (air === 'dash') {
+      this.events.airDash?.(dir);
+      // stay up until the dash has landed in its lane
+      if (this.vphase === 'hold') this.phaseT = Math.min(this.phaseT, Math.max(0, this.phaseDur - TIMING.laneChange - 0.08));
+    }
     this.lane = target;
-    this.startX = this.x;
-    this.targetX = LANES[target];
-    this.laneDuration = TIMING.airDashDuration;
-    this.laneTimer = this.laneDuration;
-    this.vMode = 'airdash';
-    this.vTimer = 0;
-    this.invulnTimer = Math.max(this.invulnTimer, TIMING.airDashDuration + TIMING.airDashGrace);
+    this.laneFrom = this.x;
+    this.laneT = 0;
+    const dist = Math.abs(LANES[target] - this.x) / (LANES[1] - LANES[0]);
+    this.laneDur = TIMING.laneChange * clamp(dist, 0.55, 1.6);
+    this.stats.lanes++;
+    this.events.lane?.(dir);
+  }
+
+  private startPhase(mode: VMode, phase: VPhase, dur: number) {
+    if (mode === 'up' && this.vmode !== 'up') {
+      // a new hop begins
+      this.airLaneUsed = 0;
+      this.hopLane = this.lane;
+    }
+    this.vmode = mode;
+    this.vphase = phase;
+    this.phaseT = 0;
+    this.phaseDur = dur;
+    this.yFrom = this.y;
+  }
+
+  /** true during a ROADSTER JUMP (higher, longer, rocket hop) */
+  isSuper = false;
+  /** true during a mythic HYPER JUMP (implies isSuper) */
+  isHyper = false;
+  /** true during a SKY ESCAPE (implies isSuper) */
+  isEscape = false;
+
+  // ---- Step 06.5 AIR DASH (road collectible) ----
+  /** true from the pickup until the wheels are back on the road */
+  isAirDash = false;
+  /** sideways direction of the dash (+1 = to the right) */
+  airDashDir: 1 | -1 = 1;
+  /** seconds since the dash started */
+  airDashT = 0;
+  /** extra hover granted so far (bounded by AIR_DASH.maxExtend) */
+  airDashExtra = 0;
+  /** lane the dash started from / lands in */
+  airDashFrom = 0;
+  airDashTo = 0;
+  private airDashLaneDone = false;
+  private airDashPending = false;
+  /** roll progress 0..1 (exactly one full turn when it reaches 1) */
+  get airDashRoll() {
+    if (!this.isAirDash) return 0;
+    return clamp01((this.airDashT - AIR_DASH.lateralStart) / AIR_DASH.lateral);
+  }
+  /** seconds until touch-down of the dash */
+  get airDashLeft() {
+    if (!this.isAirDash) return 0;
+    return this.timeToLand;
+  }
+  /**
+   * Start an AIR DASH from an outer lane (0 or 2): up to HIGH, across exactly two lanes to the
+   * opposite outer lane with one roll, land. Not from the centre lane, not during a Roadster /
+   * HYPER / SOS flight or another dash. Returns false when it can't start (pickup then just counts).
+   */
+  airDash() {
+    if (this.frozen || this.isAirDash || this.isSuper || this.isEscape) return false;
+    if (this.lane !== 0 && this.lane !== 2) return false;
+    if (this.laneT < 1) {
+      // still sliding INTO the outer lane: start the moment it is there (never from between lanes)
+      this.airDashPending = true;
+      return true;
+    }
+    const dir: 1 | -1 = this.lane === 0 ? 1 : -1;
+    this.isAirDash = true;
+    this.airDashDir = dir;
+    this.airDashT = 0;
+    this.airDashExtra = 0;
+    this.airDashFrom = this.lane;
+    this.airDashTo = 2 - this.lane;
+    this.airDashLaneDone = false;
+    this.buffer.length = 0;
+    this.pendingLane = 0;
+    this.landLane = 0;
+    this.stats.ups++;
+    this.startPhase('up', 'exec', AIR_DASH.exec * clamp(Math.abs(HEIGHT.HIGH - this.y) / (HEIGHT.HIGH - HEIGHT.NORMAL), 0.4, 1.3));
+    this.airLaneUsed = 2; // no extra air lanes on top of the dash
+    this.events.airDashStart?.(dir);
+    return true;
+  }
+  /** keep hovering a little longer (the landing spot is briefly blocked); bounded, never infinite */
+  extendAirDash(sec: number) {
+    if (!this.isAirDash || this.vmode !== 'up' || this.vphase !== 'hold') return 0;
+    const add = Math.min(sec, AIR_DASH.maxExtend - this.airDashExtra);
+    if (add <= 0) return 0;
+    this.airDashExtra += add;
+    this.phaseDur += add;
+    return add;
+  }
+
+  /** airborne enough to steer 2 lanes with an AIR DASH */
+  get canDash() {
+    return this.vmode === 'up' && this.vphase !== 'antic' && this.vphase !== 'recover' && this.y > HEIGHT.NORMAL + 0.5;
+  }
+
+  /**
+   * AIR DASH: while airborne, cross two lanes in one swipe (edge → edge).
+   * Keeps the car up until the dash has landed in its lane.
+   */
+  dash(dir: -1 | 1) {
+    if (this.frozen || !this.canDash) return false;
+    const target = this.lane + dir * 2;
+    if (target < 0 || target > 2) return false;
+    this.lane = target;
+    this.laneFrom = this.x;
+    this.laneT = 0;
+    this.laneDur = TIMING.dashDur;
+    this.pendingLane = 0;
+    this.stats.lanes += 2;
+    if (this.vphase === 'hold') this.phaseT = Math.min(this.phaseT, Math.max(0, this.phaseDur - TIMING.dashDur - 0.08));
+    this.events.lane?.(dir);
     return true;
   }
 
-  public hop(): boolean {
-    if (this.vMode === 'roadster' || this.vMode === 'hyper' || this.vMode === 'sos' || this.vMode === 'airdash') {
-      return false;
-    }
-    if (this.vMode === 'hop') {
-      return false; // UP while airborne is ignored (single hop rule)
-    }
-    if (this.restTimer > 0 && this.vMode === 'normal') {
-      return false;
-    }
-    this.vMode = 'hop';
-    this.vTimer = 0;
-    this.airLaneChanged = false;
-    this.diveSquash = 0;
-    this.hopsAndDivesCount += 1;
+  /** SKY ESCAPE: from any state, rocket straight up above every obstacle, cruise, glide down. */
+  escape() {
+    if (this.frozen || this.isEscape) return false;
+    this.isSuper = true;
+    this.isHyper = false;
+    this.isEscape = true;
+    this.buffer.length = 0;
+    this.stats.ups++;
+    this.events.up?.();
+    this.startPhase('up', 'exec', TIMING.escExec);
     return true;
   }
 
-  public dive(): boolean {
-    if (this.vMode === 'sos') return false;
-    this.vMode = 'dive';
-    this.vTimer = 0;
-    this.hopsAndDivesCount += 1;
+  /** Rocket hop granted by the ROADSTER JUMP power-up. Same ground-only rule as a normal jump. */
+  superJump(hyper = false) {
+    if (!this.canJump) return false;
+    this.isSuper = true;
+    this.isHyper = hyper;
+    this.stats.ups++;
+    this.events.up?.();
+    this.startPhase('up', 'antic', TIMING.superAntic);
     return true;
   }
 
-  public activateSpecial(special: SpecialId): boolean {
-    this.vMode = special;
-    this.vTimer = 0;
-    this.diveSquash = 0;
-    this.specialsUsedCount += 1;
-    const flightTime =
-      special === 'sos'
-        ? TIMING.superRise + TIMING.sosHold + TIMING.superFall
-        : special === 'hyper'
-          ? TIMING.superRise + TIMING.hyperHold + TIMING.superFall
-          : TIMING.superRise + TIMING.superHold + TIMING.superFall;
-    this.invulnTimer = Math.max(this.invulnTimer, flightTime + TIMING.superGrace);
-    return true;
+  private get topY(): number {
+    if (this.isAirDash) return HEIGHT.HIGH;
+    return this.isEscape ? HEIGHT.ESCAPE : this.isHyper ? HEIGHT.HYPER : this.isSuper ? HEIGHT.SUPER : HEIGHT.HIGH;
   }
 
-  public update(dt: number, roadSpeed: number): { landedShockwave: boolean } {
-    let landedShockwave = false;
+  /** earliest time the next jump may start (short rest after touching down) */
+  private jumpReadyAt = 0;
 
-    if (this.invulnTimer > 0) {
-      this.invulnTimer = Math.max(0, this.invulnTimer - dt);
+  /**
+   * One jump = one beat: launch → short hover → automatic landing.
+   * Jumping is only possible with the wheels on the road, and not during the
+   * brief rest after landing — spamming UP can never keep the car airborne.
+   */
+  get canJump() {
+    return this.vmode !== 'up' && this.y <= HEIGHT.NORMAL + 0.12 && this.time >= this.jumpReadyAt;
+  }
+
+  /** seconds the car will still be up high (0 when not in a jump or already descending) */
+  get airTimeLeft() {
+    if (this.vmode !== 'up') return 0;
+    const left = Math.max(0, this.phaseDur - this.phaseT);
+    if (this.vphase === 'antic') return left + TIMING.upExec + TIMING.upHold;
+    if (this.vphase === 'exec') return left + TIMING.upHold;
+    if (this.vphase === 'hold') return left;
+    return 0;
+  }
+
+  /** seconds until a new jump can start */
+  get jumpWait() {
+    if (this.vmode === 'up') {
+      const left = Math.max(0, this.phaseDur - this.phaseT);
+      const rest = this.vphase === 'recover' ? left : this.airTimeLeft + TIMING.upRecover;
+      return rest + TIMING.jumpRest;
     }
-    if (this.restTimer > 0) {
-      this.restTimer = Math.max(0, this.restTimer - dt);
+    return Math.max(0, this.jumpReadyAt - this.time);
+  }
+
+  /** lane swipe kept for the moment of landing */
+  private landLane: -1 | 1 | 0 = 0;
+  private landLaneT = 0;
+
+  private flyUp() {
+    const p = this.vphase;
+    if (!this.canJump) return;
+    this.stats.ups++;
+    this.events.up?.();
+    if (p === 'idle') {
+      this.startPhase('up', 'antic', TIMING.upAntic);
+    } else {
+      // interrupt: launch from current height, duration proportional to distance
+      const k = clamp(Math.abs(HEIGHT.HIGH - this.y) / (HEIGHT.HIGH - HEIGHT.NORMAL), 0.35, 1.3);
+      this.startPhase('up', 'exec', TIMING.upExec * k);
     }
+  }
 
-    // Horizontal lane interpolation
-    if (this.laneTimer > 0) {
-      this.laneTimer = Math.max(0, this.laneTimer - dt);
-      const t = 1 - this.laneTimer / this.laneDuration;
-      const smooth = t * t * (3 - 2 * t);
-      this.x = this.startX + (this.targetX - this.startX) * smooth;
-      const dir = Math.sign(this.targetX - this.startX);
-      this.steerAngle = dir * Math.sin(t * Math.PI) * 0.28;
+  private flyDown() {
+    if (this.isEscape) return; // an escape glides down on its own
+    this.isSuper = false;
+    this.isHyper = false;
+    const m = this.vmode;
+    const p = this.vphase;
+    if (m === 'down' && p === 'hold') {
+      this.phaseT = 0;
+      return;
+    }
+    if (m === 'down' && p === 'exec') {
+      this.buffer.push({ a: 'down', t: this.time });
+      return;
+    }
+    this.stats.downs++;
+    this.events.down?.();
+    if (p === 'idle') {
+      this.startPhase('down', 'antic', TIMING.downAntic);
+    } else {
+      const k = clamp(Math.abs(this.y - HEIGHT.LOW) / (HEIGHT.NORMAL - HEIGHT.LOW), 0.35, 2.2);
+      // fast-fall from HIGH: cap so a dive from the sky is still snappy
+      this.startPhase('down', 'exec', Math.min(0.24, TIMING.downExec * k));
+    }
+  }
 
-      if (this.vMode !== 'airdash' && this.vMode !== 'roadster' && this.vMode !== 'hyper') {
-        this.roll = -dir * Math.sin(t * Math.PI) * 0.16;
+  update(dt: number) {
+    this.time += dt;
+    if (this.airDashPending && this.laneT >= 1) {
+      this.airDashPending = false;
+      this.airDash();
+    }
+    // ---- AIR DASH: the sideways move starts just after lift-off and crosses exactly two lanes
+    if (this.isAirDash) {
+      this.airDashT += dt;
+      if (!this.airDashLaneDone && this.airDashT >= AIR_DASH.lateralStart) {
+        this.airDashLaneDone = true;
+        this.lane = this.airDashTo;
+        this.laneFrom = this.x;
+        this.laneT = 0;
+        this.laneDur = AIR_DASH.lateral;
+        this.stats.lanes += 2;
+        this.events.lane?.(this.airDashDir);
       }
-
-      if (this.laneTimer === 0 && this.queuedLaneDir !== 0) {
-        const q = this.queuedLaneDir;
-        this.queuedLaneDir = 0;
-        this.moveLane(q);
-      }
+    }
+    // ---- lateral
+    const prevX = this.x;
+    if (this.laneT < 1) {
+      this.laneT = Math.min(1, this.laneT + dt / this.laneDur);
+      // ease-in-out: the car eases off its lane and settles into the next, like steering a real car
+      this.x = lerp(this.laneFrom, LANES[this.lane], easeInOutCubic(this.laneT));
     } else {
       this.x = LANES[this.lane];
-      this.steerAngle *= Math.exp(-14 * dt);
-      if (this.vMode === 'normal' || this.vMode === 'dive') {
-        this.roll *= Math.exp(-12 * dt);
+      if (this.pendingLane) {
+        const d = this.pendingLane;
+        this.pendingLane = 0;
+        this.changeLane(d);
       }
     }
+    this.vx = dt > 0 ? (this.x - prevX) / dt : 0;
+    if (Math.abs(this.vx) > 0.5) this.sideThrust = Math.sign(this.vx);
+    else this.sideThrust *= Math.exp(-6 * dt);
 
-    // Vertical state machine
-    this.vTimer += dt;
+    // ---- vertical
+    if (this.vphase !== 'idle') {
+      this.phaseT += dt;
+      const p = this.phaseDur > 0 ? clamp01(this.phaseT / this.phaseDur) : 1;
+      this.applyVertical(p);
+      if (this.phaseT >= this.phaseDur) this.advancePhase();
+    } else {
+      this.y = HEIGHT.NORMAL;
+    }
 
-    if (this.vMode === 'normal') {
-      this.y += (HEIGHT.NORMAL - this.y) * Math.min(1, dt * 18);
-      this.pitch *= Math.exp(-12 * dt);
-      this.diveSquash *= Math.exp(-14 * dt);
-    } else if (this.vMode === 'hop') {
-      const riseEnd = TIMING.hopRise;
-      const holdEnd = riseEnd + TIMING.hopHold;
-      const fallEnd = holdEnd + TIMING.hopFall;
+    // ---- lane swipe held for touchdown
+    if (this.landLane && this.vmode !== 'up') {
+      const d = this.landLane;
+      this.landLane = 0;
+      if (this.time - this.landLaneT < 0.45) this.changeLane(d);
+    }
 
-      if (this.vTimer < riseEnd) {
-        const u = this.vTimer / riseEnd;
-        const ease = 1 - (1 - u) * (1 - u);
-        this.y = HEIGHT.NORMAL + (HEIGHT.HIGH - HEIGHT.NORMAL) * ease;
-        this.pitch = 0.14 * (1 - u);
-      } else if (this.vTimer < holdEnd) {
-        this.y = HEIGHT.HIGH;
-        this.pitch = 0;
-      } else if (this.vTimer < fallEnd) {
-        const u = (this.vTimer - holdEnd) / TIMING.hopFall;
-        this.y = HEIGHT.HIGH - (HEIGHT.HIGH - HEIGHT.NORMAL) * (u * u);
-        this.pitch = -0.1 * Math.sin(u * Math.PI);
-      } else {
-        this.y = HEIGHT.NORMAL;
-        this.vMode = 'normal';
-        this.vTimer = 0;
-        this.restTimer = TIMING.hopRest;
-        this.pitch = -0.06;
-      }
-    } else if (this.vMode === 'dive') {
-      const dropEnd = TIMING.diveDrop;
-      const holdEnd = dropEnd + TIMING.diveHold;
-      const riseEnd = holdEnd + TIMING.diveRise;
-
-      if (this.vTimer < dropEnd) {
-        const u = this.vTimer / dropEnd;
-        this.y = HEIGHT.NORMAL - (HEIGHT.NORMAL - HEIGHT.LOW) * u;
-        this.diveSquash = u;
-        this.pitch = -0.08 * u;
-      } else if (this.vTimer < holdEnd) {
-        this.y = HEIGHT.LOW;
-        this.diveSquash = 1;
-        this.pitch = -0.05;
-      } else if (this.vTimer < riseEnd) {
-        const u = (this.vTimer - holdEnd) / TIMING.diveRise;
-        this.y = HEIGHT.LOW + (HEIGHT.NORMAL - HEIGHT.LOW) * u;
-        this.diveSquash = 1 - u;
-        this.pitch = 0;
-      } else {
-        this.y = HEIGHT.NORMAL;
-        this.diveSquash = 0;
-        this.vMode = 'normal';
-        this.vTimer = 0;
-      }
-    } else if (this.vMode === 'airdash') {
-      const u = Math.min(1, this.vTimer / TIMING.airDashDuration);
-      this.y = HEIGHT.NORMAL + Math.sin(u * Math.PI) * (HEIGHT.HIGH - HEIGHT.NORMAL);
-      const dir = Math.sign(this.targetX - this.startX) || 1;
-      this.roll = -dir * u * Math.PI * 2; // 360 degree barrel roll
-      if (this.vTimer >= TIMING.airDashDuration) {
-        this.vMode = 'normal';
-        this.vTimer = 0;
-        this.roll = 0;
-        this.y = HEIGHT.NORMAL;
-      }
-    } else if (this.vMode === 'roadster' || this.vMode === 'hyper' || this.vMode === 'sos') {
-      const peakY =
-        this.vMode === 'sos' ? HEIGHT.SOS : this.vMode === 'hyper' ? HEIGHT.HYPER : HEIGHT.SUPER;
-      const holdDur =
-        this.vMode === 'sos'
-          ? TIMING.sosHold
-          : this.vMode === 'hyper'
-            ? TIMING.hyperHold
-            : TIMING.superHold;
-      const riseEnd = TIMING.superRise;
-      const holdEnd = riseEnd + holdDur;
-      const fallEnd = holdEnd + TIMING.superFall;
-
-      if (this.vTimer < riseEnd) {
-        const u = this.vTimer / riseEnd;
-        this.y = HEIGHT.NORMAL + (peakY - HEIGHT.NORMAL) * (1 - (1 - u) * (1 - u));
-        this.pitch = 0.24 * (1 - u);
-      } else if (this.vTimer < holdEnd) {
-        const u = (this.vTimer - riseEnd) / holdDur;
-        this.y = peakY;
-        this.pitch = 0;
-        if (this.vMode === 'roadster') {
-          this.roll = u * Math.PI * 2;
-        } else if (this.vMode === 'hyper') {
-          this.roll = u * Math.PI * 4;
-        } else {
-          this.roll = 0;
+    // ---- buffered inputs
+    if (this.buffer.length && this.vphase !== 'antic') {
+      const now = this.time;
+      const pending = this.buffer.splice(0);
+      for (const b of pending) {
+        if (b.a === 'up') {
+          // UP waits for the landing (touch-and-go), then fires at once
+          if (now - b.t > TIMING.landBuffer) continue;
+          if (this.canJump) this.flyUp();
+          else this.buffer.push(b);
+          continue;
         }
-      } else if (this.vTimer < fallEnd) {
-        const u = (this.vTimer - holdEnd) / TIMING.superFall;
-        this.y = peakY - (peakY - HEIGHT.NORMAL) * (u * u);
-        this.pitch = -0.16 * Math.sin(u * Math.PI);
-        this.roll = 0;
-      } else {
-        this.y = HEIGHT.NORMAL;
-        this.vMode = 'normal';
-        this.vTimer = 0;
-        this.roll = 0;
-        this.pitch = 0;
-        landedShockwave = true;
+        if (now - b.t > TIMING.verticalBuffer) continue;
+        if (this.vphase === 'exec' && b.a === 'down' && this.vmode === 'down') {
+          this.buffer.push(b); // still rising: hold onto it
+          continue;
+        }
+        this.flyDown();
       }
     }
 
-    // Active spoiler opens ONLY in the air (v4.5 rule)
-    const targetSpoiler = this.isAirborne() ? 1 : 0;
-    this.spoilerOpen += (targetSpoiler - this.spoilerOpen) * Math.min(1, dt * 14);
+    // ---- visual drivers (smoothed)
+    const k = 1 - Math.exp(-14 * dt);
+    const wantWings = this.vmode === 'up' && this.vphase !== 'recover' ? 1 : 0;
+    const wantTilt = this.vmode === 'up' && this.vphase !== 'recover' ? 1 : this.vmode === 'down' && this.vphase !== 'recover' ? -1 : 0;
+    const wantEngine = this.vmode === 'up' && (this.vphase === 'exec' || this.vphase === 'antic') ? 1 : this.vmode === 'up' && this.vphase === 'hold' ? 0.55 : 0;
+    const wantOrange = this.vmode === 'down' && this.vphase !== 'recover' ? 1 : 0;
+    this.wings += (wantWings - this.wings) * k;
+    this.thrusterTilt += (wantTilt - this.thrusterTilt) * k;
+    this.engine += (wantEngine - this.engine) * (1 - Math.exp(-20 * dt));
+    this.orange += (wantOrange - this.orange) * k;
+    const up = this.vmode === 'up';
+    const wantAir = up && (this.vphase !== 'recover' || this.y > 1.55) ? 1 : 0;
+    const wantRetract = this.vmode === 'down' && this.vphase !== 'recover' ? 1 : 0;
+    // pods flip to thrusters quickly on take-off, back to wheels a touch slower on landing
+    this.air += (wantAir - this.air) * (1 - Math.exp(-(wantAir ? 16 : 9) * dt));
+    this.retract += (wantRetract - this.retract) * (1 - Math.exp(-18 * dt));
+  }
 
-    // Wheel rotation
-    this.wheelSpin = (this.wheelSpin + roadSpeed * dt * 2.1) % (Math.PI * 2);
+  private applyVertical(p: number) {
+    const N = HEIGHT.NORMAL;
+    if (this.vmode === 'up') {
+      switch (this.vphase) {
+        case 'antic':
+          this.y = N - 0.07 * Math.sin(Math.PI * p);
+          this.squash = 0.18 * Math.sin(Math.PI * p);
+          break;
+        case 'exec':
+          // smooth lift: quick off the ground, gentle arrival (no bounce)
+          this.y = lerp(this.yFrom, this.topY, easeOutCubic(p));
+          this.squash = -0.12 * Math.sin(Math.PI * p);
+          break;
+        case 'hold':
+          this.y = this.topY + (this.isSuper ? 0.25 * Math.sin((this.phaseT / (this.isEscape ? TIMING.escHold : this.isHyper ? TIMING.hyperHold : TIMING.superHold)) * Math.PI) : 0.04 * Math.sin(this.phaseT * 6));
+          this.squash = 0;
+          break;
+        case 'recover':
+          this.y = lerp(this.yFrom, N, easeInOutSine(p));
+          this.squash = p > 0.85 ? 0.2 * Math.sin(((p - 0.85) / 0.15) * Math.PI) : 0;
+          break;
+      }
+    } else if (this.vmode === 'down') {
+      switch (this.vphase) {
+        case 'antic':
+          this.y = N + 0.1 * Math.sin(Math.PI * p);
+          this.squash = -0.1 * Math.sin(Math.PI * p);
+          break;
+        case 'exec':
+          this.y = lerp(this.yFrom, HEIGHT.LOW, easeOutQuad(p));
+          this.squash = 0.32 * p;
+          break;
+        case 'hold':
+          this.y = HEIGHT.LOW + 0.02 * Math.sin(this.phaseT * 14);
+          this.squash = 0.32;
+          break;
+        case 'recover':
+          this.y = lerp(this.yFrom, N, easeOutBack(p, 1.4));
+          this.squash = 0.32 * (1 - p) - 0.08 * Math.sin(Math.PI * p);
+          break;
+      }
+    }
+  }
 
-    return { landedShockwave };
+  private advancePhase() {
+    const m = this.vmode;
+    switch (this.vphase) {
+      case 'antic':
+        this.startPhase(m, 'exec', m === 'up' ? (this.isEscape ? TIMING.escExec : this.isHyper ? TIMING.hyperExec : this.isSuper ? TIMING.superExec : TIMING.upExec) : TIMING.downExec);
+        break;
+      case 'exec':
+        if (m === 'up' && this.isAirDash) {
+          this.startPhase(m, 'hold', AIR_DASH.hold);
+          break;
+        }
+        this.startPhase(m, 'hold', m === 'up' ? (this.isEscape ? TIMING.escHold : this.isHyper ? TIMING.hyperHold : this.isSuper ? TIMING.superHold : TIMING.upHold) : TIMING.downHold);
+        break;
+      case 'hold':
+        if (m === 'up' && this.isAirDash) {
+          this.startPhase(m, 'recover', AIR_DASH.recover);
+          break;
+        }
+        this.startPhase(m, 'recover', m === 'up' ? (this.isEscape ? TIMING.escRecover : this.isHyper ? TIMING.hyperRecover : this.isSuper ? TIMING.superRecover : TIMING.upRecover) : TIMING.downRecover);
+        break;
+      case 'recover':
+        this.vmode = 'none';
+        this.vphase = 'idle';
+        this.y = HEIGHT.NORMAL;
+        this.squash = 0;
+        if (m === 'up') this.jumpReadyAt = this.time + TIMING.jumpRest;
+        this.isSuper = false;
+        this.isHyper = false;
+        this.isEscape = false;
+        this.isAirDash = false;
+        this.events.land?.(m);
+        break;
+    }
+  }
+
+  /** Current collision box in world space (car is always at z = 0). */
+  hitbox(out: Box): Box {
+    const low = clamp01((HEIGHT.NORMAL - this.y) / (HEIGHT.NORMAL - HEIGHT.LOW));
+    const hy = lerp(CAR_HALF.y, CAR_HALF_Y_LOW, low);
+    out.minX = this.x - CAR_HALF.x;
+    out.maxX = this.x + CAR_HALF.x;
+    out.minY = this.y - hy;
+    out.maxY = this.y + hy;
+    out.minZ = -CAR_HALF.z;
+    out.maxZ = CAR_HALF.z;
+    return out;
+  }
+
+  /** Height state label for HUD/debug. */
+  get heightState(): 'LOW' | 'NORMAL' | 'HIGH' {
+    if (this.y > (HEIGHT.NORMAL + HEIGHT.HIGH) / 2) return 'HIGH';
+    if (this.y < (HEIGHT.NORMAL + HEIGHT.LOW) / 2 + 0.05) return 'LOW';
+    return 'NORMAL';
   }
 }

@@ -1,132 +1,133 @@
-// Pure gameplay rules for obstacles & pass heights (Zero Three.js or DOM imports)
+import { LANES } from '../config.ts';
+import {
+  box,
+  type Box,
+  type ObstacleSpec,
+  type LaserMode,
+  PASS_ALL,
+  PASS_H,
+  PASS_L,
+  PASS_N,
+  PASS_NONE,
+} from './types.ts';
 
-export const PASS_MASK = {
-  NONE: 0,
-  LOW: 1,    // Dive under
-  NORMAL: 2, // Driving height
-  HIGH: 4,   // Hop over
-} as const;
+/**
+ * Single source of truth for every obstacle's collision volume and which car
+ * heights pass it. The spawner's fairness check and the runtime collision both
+ * read from here, so they can never disagree.
+ *
+ * Car heights (centre ± half): LOW 0.20–0.76, NORMAL 0.64–1.36, HIGH 2.69–3.41.
+ */
 
-export type ObstacleKind =
-  | 'crate'
-  | 'barrier'
-  | 'beam'
-  | 'drone'
-  | 'laser_low'
-  | 'laser_high'
-  | 'traffic'
-  | 'ring'
-  | 'gate_closed'
-  | 'gate_open';
+const laserMask = (m: LaserMode) =>
+  m === 'low' ? PASS_H : m === 'high' ? PASS_L : m === 'block' ? PASS_NONE : PASS_ALL;
 
-export interface ObstacleRule {
-  kind: ObstacleKind;
-  halfX: number;
-  minY: number;
-  maxY: number;
-  halfZ: number;
-  passMask: number; // Bitmask of PASS_MASK values that safely clear this obstacle
-  isBonusRing?: boolean;
-  movesLanes?: boolean;
-  oncomingSpeed?: number;
+export function rowMasks(obstacles: ObstacleSpec[]): [number, number, number] {
+  const m: [number, number, number] = [PASS_ALL, PASS_ALL, PASS_ALL];
+  for (const o of obstacles) {
+    const lm = obstacleMasks(o);
+    for (let i = 0; i < 3; i++) m[i] &= lm[i];
+  }
+  return m;
 }
 
-export const OBSTACLE_RULES: Record<ObstacleKind, ObstacleRule> = {
-  crate: {
-    kind: 'crate',
-    halfX: 0.92,
-    minY: 0.0,
-    maxY: 1.65,
-    halfZ: 0.95,
-    passMask: PASS_MASK.HIGH, // Change lane or hop over
-  },
-  barrier: {
-    kind: 'barrier',
-    halfX: 1.05,
-    minY: 0.0,
-    maxY: 1.35,
-    halfZ: 0.55,
-    passMask: PASS_MASK.HIGH, // Hop over
-  },
-  beam: {
-    kind: 'beam',
-    halfX: 1.15,
-    minY: 1.05,
-    maxY: 3.8,
-    halfZ: 0.65,
-    passMask: PASS_MASK.LOW, // Dive under
-  },
-  drone: {
-    kind: 'drone',
-    halfX: 0.85,
-    minY: 0.35,
-    maxY: 1.75,
-    halfZ: 0.85,
-    passMask: PASS_MASK.HIGH,
-    movesLanes: true,
-  },
-  laser_low: {
-    kind: 'laser_low',
-    halfX: 1.1,
-    minY: 0.1,
-    maxY: 1.4,
-    halfZ: 0.35,
-    passMask: PASS_MASK.HIGH,
-  },
-  laser_high: {
-    kind: 'laser_high',
-    halfX: 1.1,
-    minY: 1.05,
-    maxY: 4.2,
-    halfZ: 0.35,
-    passMask: PASS_MASK.LOW,
-  },
-  traffic: {
-    kind: 'traffic',
-    halfX: 0.86,
-    minY: 0.0,
-    maxY: 2.35,
-    halfZ: 1.85,
-    passMask: PASS_MASK.NONE, // Must change lane (unless in SUPER / HYPER / SOS flight)
-    oncomingSpeed: 14.0,
-  },
-  ring: {
-    kind: 'ring',
-    halfX: 1.15,
-    minY: 0.1,
-    maxY: 2.6,
-    halfZ: 0.4,
-    passMask: PASS_MASK.LOW | PASS_MASK.NORMAL | PASS_MASK.HIGH,
-    isBonusRing: true,
-  },
-  gate_closed: {
-    kind: 'gate_closed',
-    halfX: 1.2,
-    minY: 0.0,
-    maxY: 4.5,
-    halfZ: 0.7,
-    passMask: PASS_MASK.NONE,
-  },
-  gate_open: {
-    kind: 'gate_open',
-    halfX: 1.2,
-    minY: 2.5,
-    maxY: 4.5,
-    halfZ: 0.7,
-    passMask: PASS_MASK.LOW | PASS_MASK.NORMAL,
-  },
-};
-
-export function heightToMask(y: number): number {
-  if (y >= 2.15) return PASS_MASK.HIGH;
-  if (y <= 0.52) return PASS_MASK.LOW;
-  return PASS_MASK.NORMAL;
+export function obstacleMasks(o: ObstacleSpec): [number, number, number] {
+  const m: [number, number, number] = [PASS_ALL, PASS_ALL, PASS_ALL];
+  switch (o.type) {
+    case 'crate':
+    case 'barrier':
+      m[o.lane] = PASS_H;
+      break;
+    case 'beam':
+      m[o.lane] = PASS_L;
+      break;
+    case 'drone':
+    case 'platform':
+      m[o.lane] = PASS_H;
+      m[o.lane2 ?? o.lane] = PASS_H;
+      break;
+    case 'traffic':
+    case 'asteroid':
+      m[o.lane] = PASS_NONE;
+      break;
+    case 'ring':
+      m[o.lane] = PASS_L | PASS_N;
+      break;
+    case 'laser':
+      for (let i = 0; i < 3; i++) m[i] = laserMask(o.laser![i]);
+      break;
+    case 'gate':
+      for (let i = 0; i < 3; i++) m[i] = i === o.door ? PASS_L | PASS_N : PASS_NONE;
+      break;
+  }
+  return m;
 }
 
-export function canPassObstacle(kind: ObstacleKind, carY: number): boolean {
-  if (carY >= 4.6) return true; // Roadster Jump / HYPER JUMP / Sky Escape clear everything
-  const rule = OBSTACLE_RULES[kind];
-  if (rule.isBonusRing) return true;
-  const mask = heightToMask(carY);
-  return (rule.passMask & mask) !== 0;
+/** Sweep parameters for moving obstacles, as a pure function of remaining distance. */
+export function sweepX(o: ObstacleSpec, zRemaining: number): number {
+  if (o.type !== 'drone' && o.type !== 'platform') return 0;
+  const a = LANES[o.lane];
+  const b = LANES[o.lane2 ?? o.lane];
+  const mid = (a + b) / 2;
+  const half = Math.abs(b - a) / 2;
+  const k = (o.type === 'drone' ? 0.16 : 0.11) * (o.sweep ?? 1);
+  return mid + half * Math.sin(zRemaining * k + (o.variant ?? 0) * 1.7);
 }
+
+/** Oncoming traffic closes faster than the road; it still arrives exactly with its row. */
+export const TRAFFIC_CLOSING = 0.6;
+export function zOffset(o: ObstacleSpec, zRemaining: number): number {
+  return o.type === 'traffic' ? zRemaining * TRAFFIC_CLOSING : 0;
+}
+
+/** Local hitboxes. `sx` is the current sweep x (moving types) — x values are world space. */
+export function hitboxes(o: ObstacleSpec, sx: number, out: Box[] = []): Box[] {
+  out.length = 0;
+  const lx = LANES[o.lane];
+  switch (o.type) {
+    case 'crate':
+      out.push(box(lx, 0.85, 0, 0.85, 0.85, 0.85));
+      break;
+    case 'barrier':
+      out.push(box(lx, 0.7, 0, 1.25, 0.65, 0.2));
+      break;
+    case 'beam':
+      out.push(box(lx, 3.45, 0, 1.25, 2.5, 0.5));
+      break;
+    case 'drone':
+      out.push(box(sx, 1.2, 0, 0.9, 0.7, 0.8));
+      break;
+    case 'platform':
+      out.push(box(sx, 0.55, 0, 1.2, 0.55, 1.6));
+      break;
+    case 'traffic':
+      out.push(box(lx, 1.6, 0, 0.85, 1.3, 1.8));
+      break;
+    case 'asteroid':
+      out.push(box(lx, 1.3, 0, 1.1, 1.3, 1.1));
+      break;
+    case 'ring':
+      out.push(box(lx, 2.65, 0, 1.45, 0.25, 0.25));
+      out.push(box(lx - 1.3, 1.3, 0, 0.15, 1.3, 0.25));
+      out.push(box(lx + 1.3, 1.3, 0, 0.15, 1.3, 0.25));
+      break;
+    case 'laser':
+      for (let i = 0; i < 3; i++) {
+        const x = LANES[i];
+        const m = o.laser![i];
+        if (m === 'low') out.push(box(x, 0.78, 0, 1.3, 0.68, 0.15));
+        else if (m === 'high') out.push(box(x, 3.46, 0, 1.3, 2.54, 0.15));
+        else if (m === 'block') out.push(box(x, 3, 0, 1.3, 3, 0.15));
+      }
+      break;
+    case 'gate':
+      for (let i = 0; i < 3; i++) {
+        const x = LANES[i];
+        if (i === o.door) out.push(box(x, 4.4, 0, 1.3, 2.0, 0.4));
+        else out.push(box(x, 3.5, 0, 1.3, 3.5, 0.4));
+      }
+      break;
+  }
+  return out;
+}
+
