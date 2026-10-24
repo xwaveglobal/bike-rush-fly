@@ -1,0 +1,11 @@
+node_modules
+dist
+dist-esbuild
+*.log
+.DS_Store
+.env
+.env.*
+.vscode/
+.idea/
+server/data.json
+__pycache__/
